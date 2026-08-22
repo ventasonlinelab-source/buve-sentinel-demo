@@ -1039,16 +1039,16 @@
      * =========================================
      * KORTEX LANDING · CONFIGURACIÓN
      * =========================================
-     * Los webhooks se conservan intactos como referencia.
-     * Esta versión temporal no ejecuta WF2 ni WF3.
+     * Versión LIVE: la interfaz no avanza hasta recibir confirmación de n8n.
      */
     const CONFIG = {
       videoEmbedUrl: "",
-      webhookUrl: "https://n8n.kortex10x.com/webhook-test/buve/formulario-1",
-      webhookFormulario2: "https://n8n.kortex10x.com/webhook-test/buve/formulario-2",
-      webhookSetter: "https://n8n.kortex10x.com/webhook-test/buve/setter",
+      webhookUrl: "https://n8n.kortex10x.com/webhook/buve/formulario-1",
+      webhookFormulario2: "https://n8n.kortex10x.com/webhook/buve/formulario-2",
+      webhookSetter: "https://n8n.kortex10x.com/webhook/buve/setter",
 
-      demoMode: true,
+      demoMode: false,
+      schemaVersion: "buve_crm_v1",
 
       /**
        * MOTOR DEMO TEMPORAL · QA
@@ -1063,12 +1063,36 @@
        * ?demo_route=llamar_ahora
        * ?demo_route=calendario
        */
-      demoForceRoute: "auto",
-
       telegramBotUsername: "Buve_Invest_bot",
       source: "kortex_demo_landing",
-      version: "landing_buve_demo_v2_2_2026-08-22_11-26"
+      version: "landing_buve_live_n8n_crm_v2_2026-08-22"
     };
+
+    async function apiPost(url, payload) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      let data = {};
+      try { data = await response.json(); } catch (_) {}
+      if (!response.ok || data.ok === false) {
+        const error = new Error(data.error || "No hemos podido completar la solicitud.");
+        error.payload = data;
+        throw error;
+      }
+      return data;
+    }
+
+    function encontrarRuta(respuesta) {
+      let actual = respuesta;
+      for (let i = 0; i < 5 && actual; i++) {
+        const ruta = actual.ruta || actual.proxima_accion;
+        if (["no_cualifica", "llamar_ahora", "calendario"].includes(ruta)) return ruta;
+        actual = actual.siguiente;
+      }
+      return null;
+    }
 
     const $ = (selector) => document.querySelector(selector);
     const form = $("#leadForm");
@@ -1086,13 +1110,36 @@
       return "lead_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
     }
 
+    function getOrCreateLeadId() {
+      const key = "buve_lead_id";
+      const existing = sessionStorage.getItem(key);
+      if (existing) return existing;
+      const created = uuid();
+      sessionStorage.setItem(key, created);
+      return created;
+    }
+
+    function deterministicId(prefix, ...parts) {
+      const raw = parts.filter(Boolean).join("|");
+      let hash = 2166136261;
+      for (let i = 0; i < raw.length; i++) {
+        hash ^= raw.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return prefix + "_" + (hash >>> 0).toString(16).padStart(8, "0");
+    }
+
     const DEMO_STATE = {
-      lead_id: uuid(),
+      lead_id: getOrCreateLeadId(),
       formulario1: null,
       clasificacion: null,
       contexto_original: "",
       ruta: null,
-      slot_seleccionado: null
+      slot_seleccionado: null,
+      slots: [],
+      score: 0,
+      prioridad: "normal",
+      clasificacion_servidor: null
     };
 
     function initVideo() {
@@ -1154,40 +1201,6 @@
       };
     }
 
-    function rutaForzada() {
-      const p = new URLSearchParams(window.location.search);
-      const desdeUrl = p.get("demo_route");
-      const valor = desdeUrl || CONFIG.demoForceRoute || "auto";
-      return ["auto", "no_cualifica", "llamar_ahora", "calendario"].includes(valor)
-        ? valor
-        : "auto";
-    }
-
-    function decidirRutaTemporal(clasificacion, urgencia) {
-      const forced = rutaForzada();
-      if (forced !== "auto") return forced;
-
-      if (clasificacion === "BRONCE") {
-        return "no_cualifica";
-      }
-
-      if (
-        ["PLATA", "ORO", "ORO FUERTE"].includes(clasificacion) &&
-        urgencia === "inmediata"
-      ) {
-        return "llamar_ahora";
-      }
-
-      if (
-        ["PLATA", "ORO", "ORO FUERTE"].includes(clasificacion) &&
-        ["menos_30_dias", "menos_90_dias", "mas_90_dias"].includes(urgencia)
-      ) {
-        return "calendario";
-      }
-
-      return "no_cualifica";
-    }
-
     function mostrarFormulario2() {
       document.body.classList.remove("bronze-result");
       document.body.classList.add("qualified-result");
@@ -1229,7 +1242,7 @@
       debugLeadId();
     }
 
-    function submitFormulario2Temporal(event) {
+    async function submitFormulario2Temporal(event) {
       event.preventDefault();
 
       const f = document.querySelector("#formulario2");
@@ -1248,25 +1261,31 @@
       button.disabled = true;
       button.textContent = "Continuando…";
 
-      // La respuesta abierta se conserva, pero NO participa en la decisión.
       DEMO_STATE.contexto_original = textarea.value.trim();
-
-      DEMO_STATE.ruta = decidirRutaTemporal(
-        DEMO_STATE.clasificacion,
-        DEMO_STATE.formulario1.urgencia_inversion
-      );
-
-      console.info("[BUVE QA] Paso 2 almacenado", {
-        lead_id: DEMO_STATE.lead_id,
-        clasificacion: DEMO_STATE.clasificacion,
-        urgencia_inversion: DEMO_STATE.formulario1.urgencia_inversion,
-        ruta: DEMO_STATE.ruta
-      });
-
-      mostrarParte3Temporal();
+      try {
+        const respuesta = await apiPost(CONFIG.webhookFormulario2, {
+          lead_id: DEMO_STATE.lead_id,
+          tipo_contexto: "texto",
+          contexto_original: DEMO_STATE.contexto_original,
+          audio_contexto: null,
+          rango_capital: DEMO_STATE.formulario1.rango_capital,
+          urgencia_inversion: DEMO_STATE.formulario1.urgencia_inversion,
+          completado_en: new Date().toISOString(),
+          contract_version: CONFIG.schemaVersion
+        });
+        DEMO_STATE.ruta = encontrarRuta(respuesta);
+        if (!DEMO_STATE.ruta) throw new Error("La respuesta del sistema no contiene una ruta válida.");
+        await mostrarParte3Live();
+      } catch (error) {
+        errorBox.textContent = error.message || "No hemos podido procesar tu contexto.";
+        errorBox.style.display = "block";
+        button.disabled = false;
+        button.textContent = "CONTINUAR";
+      }
     }
 
     function generarSlotsTemporales() {
+      if (DEMO_STATE.slots.length) return DEMO_STATE.slots;
       const slots = [];
       const horas = [[10,0], [12,30], [17,0]];
       const ahora = new Date();
@@ -1330,16 +1349,34 @@
         </section>
       `;
 
-      document.querySelector("#callNowBtn").addEventListener("click", () => {
-        document.querySelector("main").innerHTML = `
+      document.querySelector("#callNowBtn").addEventListener("click", async () => {
+        const button = document.querySelector("#callNowBtn");
+        button.disabled = true;
+        button.textContent = "SOLICITANDO…";
+        try {
+          await apiPost(CONFIG.webhookSetter, {
+            action: "llamar_ahora",
+            lead_id: DEMO_STATE.lead_id,
+            ruta: DEMO_STATE.ruta,
+            score: DEMO_STATE.score,
+            prioridad: DEMO_STATE.prioridad,
+            id_pedido: deterministicId("ped", DEMO_STATE.lead_id, "llamar_ahora"),
+            contract_version: CONFIG.schemaVersion
+          });
+          document.querySelector("main").innerHTML = `
           <section class="setter-result" aria-live="polite">
             <div class="setter-result-icon">✓</div>
             <div class="setter-step">SOLICITUD RECIBIDA</div>
             <h2>Perfecto. Hemos recibido tu solicitud.</h2>
             <p>Un miembro del equipo se pondrá en contacto contigo.</p>
           </section>
-        `;
-        debugLeadId();
+          `;
+          debugLeadId();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = "SOLICITAR LLAMADA AHORA";
+          alert(error.message || "No hemos podido solicitar la llamada.");
+        }
       });
 
       debugLeadId();
@@ -1400,36 +1437,60 @@
         });
       });
 
-      document.querySelector("#reserveBtn").addEventListener("click", () => {
+      document.querySelector("#reserveBtn").addEventListener("click", async () => {
         if (!DEMO_STATE.slot_seleccionado) return;
-
+        const button = document.querySelector("#reserveBtn");
+        button.disabled = true;
+        button.textContent = "CONFIRMANDO…";
         const texto = `${formatearDia(DEMO_STATE.slot_seleccionado)} a las ${formatearHora(DEMO_STATE.slot_seleccionado)}`;
-
-        document.querySelector("main").innerHTML = `
+        try {
+          await apiPost(CONFIG.webhookSetter, {
+            action: "reservar",
+            lead_id: DEMO_STATE.lead_id,
+            ruta: DEMO_STATE.ruta,
+            fecha_hora: DEMO_STATE.slot_seleccionado,
+            id_reserva: deterministicId("res", DEMO_STATE.lead_id, DEMO_STATE.slot_seleccionado),
+            id_pedido: deterministicId("ped", DEMO_STATE.lead_id, "reservar", DEMO_STATE.slot_seleccionado),
+            score: DEMO_STATE.score,
+            prioridad: DEMO_STATE.prioridad,
+            contract_version: CONFIG.schemaVersion
+          });
+          document.querySelector("main").innerHTML = `
           <section class="setter-result" aria-live="polite">
             <div class="setter-result-icon">✓</div>
             <div class="setter-step">RESERVA CONFIRMADA</div>
             <h2>Perfecto. Tu llamada ha quedado reservada.</h2>
             <p>Horario: <strong>${texto}</strong>.</p>
           </section>
-        `;
-        debugLeadId();
+          `;
+          debugLeadId();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = "CONFIRMAR HORARIO";
+          alert(error.message || "No hemos podido confirmar el horario.");
+        }
       });
 
       debugLeadId();
     }
 
-    function mostrarParte3Temporal() {
+    async function mostrarParte3Live() {
       if (DEMO_STATE.ruta === "no_cualifica") {
         mostrarNoCualifica();
         return;
       }
-
       if (DEMO_STATE.ruta === "llamar_ahora") {
         mostrarLlamarAhora();
         return;
       }
-
+      const respuesta = await apiPost(CONFIG.webhookSetter, {
+        action: "consultar_slots",
+        lead_id: DEMO_STATE.lead_id,
+        ruta: DEMO_STATE.ruta,
+        contract_version: CONFIG.schemaVersion
+      });
+      DEMO_STATE.slots = Array.isArray(respuesta.slots) ? respuesta.slots : [];
+      if (!DEMO_STATE.slots.length) throw new Error("No hay horarios disponibles en este momento.");
       mostrarCalendario();
     }
 
@@ -1460,7 +1521,7 @@
       badge.textContent = "lead_id: " + DEMO_STATE.lead_id;
     }
 
-    function submitFormulario1(event) {
+    async function submitFormulario1(event) {
       event.preventDefault();
       clearError();
 
@@ -1489,114 +1550,47 @@
         urgencia_inversion: payload.urgencia_inversion
       });
 
-      setTimeout(() => {
+      try {
+        const respuestaF1 = await apiPost(CONFIG.webhookUrl, {
+          event: "lead_form_submitted",
+          schema_version: CONFIG.schemaVersion,
+          lead_id: DEMO_STATE.lead_id,
+          source: {
+            channel: CONFIG.source,
+            version: CONFIG.version,
+            url: location.href,
+            referrer: document.referrer
+          },
+          form_data: {
+            full_name: payload.nombre,
+            email: payload.email,
+            phone: payload.telefono,
+            capital_range: payload.rango_capital,
+            investment_timing: payload.urgencia_inversion,
+            has_invested: payload.has_invested,
+            privacy_consent: payload.privacy_consent
+          },
+          timestamps: { submitted_at: payload.timestamp }
+        });
+        DEMO_STATE.score = Number(respuestaF1.score || 0);
+        DEMO_STATE.prioridad = respuestaF1.prioridad || "normal";
+        DEMO_STATE.clasificacion_servidor = respuestaF1.clasificacion || null;
         mostrarFormulario2();
-      }, 350);
-    }
-
-    /**
-     * QA automatizado del MOTOR DEMO TEMPORAL V2.2.
-     * No afecta a la experiencia visual.
-     */
-    function runMandatoryTestsV22() {
-      const route = (capital, urgencia) =>
-        decidirRutaTemporal(calcularClasificacionPorCapital(capital), urgencia);
-
-      const casos = [
-        ["1. lt_50k + inmediata", route("lt_50k", "inmediata"), "no_cualifica"],
-        ["2. lt_50k + respuesta abierta cualquiera", route("lt_50k", "mas_90_dias"), "no_cualifica"],
-        ["3. 50k_149k + inmediata", route("50k_149k", "inmediata"), "llamar_ahora"],
-        ["4. 150k_249k + menos_30_dias", route("150k_249k", "menos_30_dias"), "calendario"],
-        ["5. 250k_499k + menos_90_dias", route("250k_499k", "menos_90_dias"), "calendario"],
-        ["6. 500k_999k + inmediata", route("500k_999k", "inmediata"), "llamar_ahora"],
-        ["7. 1m_plus + mas_90_dias", route("1m_plus", "mas_90_dias"), "calendario"]
-      ].map(([nombre, obtenido, esperado]) => ({
-        nombre, obtenido, esperado, ok: obtenido === esperado
-      }));
-
-      // Caso 8: la pregunta abierta NO participa en decidirRutaTemporal.
-      const rutaA = route("250k_499k", "menos_30_dias");
-      const textoA = "Quiero invertir porque busco diversificar.";
-      const rutaB = route("250k_499k", "menos_30_dias");
-      const textoB = "Texto completamente diferente que no debe modificar la ruta.";
-      const caso8 = {
-        nombre: "8. Respuestas abiertas distintas mantienen la misma ruta",
-        textoA,
-        textoB,
-        rutaA,
-        rutaB,
-        ok: rutaA === rutaB
-      };
-
-      // Caso 9: el estado usa una sola referencia de lead_id.
-      const idInicial = DEMO_STATE.lead_id;
-      const caso9 = {
-        nombre: "9. lead_id único y persistente",
-        fase1: DEMO_STATE.lead_id,
-        fase2: DEMO_STATE.lead_id,
-        fase3: DEMO_STATE.lead_id,
-        confirmacion: DEMO_STATE.lead_id,
-        ok: [DEMO_STATE.lead_id, DEMO_STATE.lead_id, DEMO_STATE.lead_id, DEMO_STATE.lead_id]
-          .every(x => x === idInicial)
-      };
-
-      // Caso 10: inspección estática de los textos que el motor inyecta en pantalla.
-      const visiblesMotor = [
-        "Cuéntanos qué estás buscando",
-        "Queremos entender qué te ha llevado a plantearte invertir y qué esperas conseguir.",
-        "Podemos hablar contigo ahora.",
-        "Pulsa el botón para solicitar la llamada.",
-        "Perfecto. Hemos recibido tu solicitud.",
-        "Selecciona el horario que mejor te encaje.",
-        "Perfecto. Tu llamada ha quedado reservada.",
-        "Gracias por compartir tu situación."
-      ].join(" ").toLowerCase();
-
-      const caso10 = {
-        nombre: "10. Pantallas visibles sin referencias técnicas",
-        ok: !/\b(?:demo|simulado|simulada)\b/i.test(visiblesMotor)
-      };
-
-      // Caso 11: urgencias canónicas en español.
-      const urgencias = ["inmediata", "menos_30_dias", "menos_90_dias", "mas_90_dias"];
-      const caso11 = {
-        nombre: "11. Urgencias internas solo en español",
-        urgencias,
-        ok: JSON.stringify(urgencias) === JSON.stringify([
-          "inmediata",
-          "menos_30_dias",
-          "menos_90_dias",
-          "mas_90_dias"
-        ])
-      };
-
-      const resultados = [...casos, caso8, caso9, caso10, caso11];
-
-      console.groupCollapsed("[BUVE QA] Pruebas obligatorias V2.2");
-      resultados.forEach(r => console[r.ok ? "log" : "error"](r.nombre, r));
-      console.groupEnd();
-
-      return {
-        resultados,
-        ok: resultados.every(r => r.ok)
-      };
+      } catch (error) {
+        showError(error.message || "No hemos podido registrar tu solicitud.");
+        submitBtn.disabled = false;
+        submitBtn.textContent = "CONTINUAR";
+      }
     }
 
     initVideo();
     form.addEventListener("submit", submitFormulario1);
 
-    window.BUVE_DEMO = {
+    window.BUVE_LIVE = {
       state: DEMO_STATE,
       config: CONFIG,
-      calcularClasificacionPorCapital,
-      decidirRutaTemporal,
-      runMandatoryTestsV22
+      encontrarRuta
     };
-
-    const TEST_RESULT_V22 = runMandatoryTestsV22();
-    if (!TEST_RESULT_V22.ok) {
-      console.error("[BUVE QA] Una o más pruebas obligatorias V2.2 han fallado.", TEST_RESULT_V22);
-    }
   </script>
 </body>
 </html>
